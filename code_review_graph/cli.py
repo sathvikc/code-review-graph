@@ -640,14 +640,23 @@ def main() -> None:
                 print(f"Built on branch: {stored_branch}")
             if stored_sha:
                 print(f"Built at commit: {stored_sha[:12]}")
-            from .incremental import _git_branch_info
-            current_branch, current_sha = _git_branch_info(repo_root)
-            if stored_branch and current_branch and stored_branch != current_branch:
-                print(
-                    f"WARNING: Graph was built on '{stored_branch}' "
-                    f"but you are now on '{current_branch}'. "
-                    f"Run 'code-review-graph build' to rebuild."
-                )
+            from .incremental import _git_branch_info, detect_vcs
+            vcs = detect_vcs(repo_root)
+            if vcs == "git":
+                current_branch, current_sha = _git_branch_info(repo_root)
+                if stored_branch and current_branch and stored_branch != current_branch:
+                    print(
+                        f"WARNING: Graph was built on '{stored_branch}' "
+                        f"but you are now on '{current_branch}'. "
+                        f"Run 'code-review-graph build' to rebuild."
+                    )
+            elif vcs == "svn":
+                stored_rev = store.get_metadata("svn_revision")
+                stored_svn_branch = store.get_metadata("svn_branch")
+                if stored_svn_branch:
+                    print(f"SVN branch: {stored_svn_branch}")
+                if stored_rev:
+                    print(f"SVN revision at build: {stored_rev}")
 
         elif args.command == "watch":
             watch(repo_root, store)
