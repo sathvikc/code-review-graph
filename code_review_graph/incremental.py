@@ -15,14 +15,12 @@ import re
 import subprocess
 import time
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Callable, Optional
 
 from .graph import GraphStore
 from .parser import CodeParser
 
-_MAX_PARSE_WORKERS = int(os.environ.get(
-    "CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))
-))
+_MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
 
 logger = logging.getLogger(__name__)
 
@@ -283,9 +281,7 @@ _GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configur
 # When True, `git ls-files --recurse-submodules` is used so that files
 # inside git submodules are included in the graph.  Opt-in via env var;
 # can also be overridden per-call through function parameters.
-_RECURSE_SUBMODULES = os.environ.get(
-    "CRG_RECURSE_SUBMODULES", ""
-).lower() in ("1", "true", "yes")
+_RECURSE_SUBMODULES = os.environ.get("CRG_RECURSE_SUBMODULES", "").lower() in ("1", "true", "yes")
 
 
 def _git_branch_info(repo_root: Path) -> tuple[str, str]:
@@ -295,8 +291,10 @@ def _git_branch_info(repo_root: Path) -> tuple[str, str]:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True,
-            cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
         )
         if result.returncode == 0:
             branch = result.stdout.strip()
@@ -305,14 +303,17 @@ def _git_branch_info(repo_root: Path) -> tuple[str, str]:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True,
-            cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
         )
         if result.returncode == 0:
             sha = result.stdout.strip()
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return branch, sha
+
 
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 
@@ -422,11 +423,7 @@ def collect_all_files(
         candidates = tracked
     else:
         # Fallback: walk directory
-        candidates = [
-            str(p.relative_to(repo_root))
-            for p in repo_root.rglob("*")
-            if p.is_file()
-        ]
+        candidates = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*") if p.is_file()]
 
     for rel_path in candidates:
         if _should_ignore(rel_path, ignore_patterns):
@@ -518,7 +515,8 @@ def find_dependents(
         if len(all_dependents) > _MAX_DEPENDENT_FILES:
             logger.warning(
                 "Dependent expansion capped at %d files for %s",
-                len(all_dependents), file_path,
+                len(all_dependents),
+                file_path,
             )
             return DependentList(
                 list(all_dependents)[:_MAX_DEPENDENT_FILES],
@@ -607,7 +605,8 @@ def full_build(
             max_workers=_MAX_PARSE_WORKERS,
         ) as executor:
             for i, (rel_path, nodes, edges, error, fhash) in enumerate(
-                executor.map(_parse_single_file, args_list, chunksize=20), 1,
+                executor.map(_parse_single_file, args_list, chunksize=20),
+                1,
             ):
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
@@ -615,7 +614,10 @@ def full_build(
                     continue
                 full_path = repo_root / rel_path
                 store.store_file_nodes_edges(
-                    str(full_path), nodes, edges, fhash,
+                    str(full_path),
+                    nodes,
+                    edges,
+                    fhash,
                 )
                 total_nodes += len(nodes)
                 total_edges += len(edges)
@@ -733,14 +735,19 @@ def incremental_update(
             max_workers=_MAX_PARSE_WORKERS,
         ) as executor:
             for rel_path, nodes, edges, error, fhash in executor.map(
-                _parse_single_file, args_list, chunksize=20,
+                _parse_single_file,
+                args_list,
+                chunksize=20,
             ):
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
                     continue
                 store.store_file_nodes_edges(
-                    str(repo_root / rel_path), nodes, edges, fhash,
+                    str(repo_root / rel_path),
+                    nodes,
+                    edges,
+                    fhash,
                 )
                 total_nodes += len(nodes)
                 total_edges += len(edges)
@@ -772,10 +779,22 @@ def incremental_update(
 _DEBOUNCE_SECONDS = 0.3
 
 
-def watch(repo_root: Path, store: GraphStore) -> None:
+def watch(
+    repo_root: Path,
+    store: GraphStore,
+    on_files_updated: Optional[Callable] = None,
+) -> None:
     """Watch for file changes and auto-update the graph.
 
     Uses a 300ms debounce to batch rapid-fire saves into a single update.
+
+    Args:
+        repo_root: Repository root to watch.
+        store: Graph database to update.
+        on_files_updated: Optional callback invoked after each debounced
+            batch of file updates completes.  Receives the store as its
+            only argument.  Used by the CLI to run post-processing
+            (FTS, flows, communities) after watch updates.
     """
     import threading
 
@@ -839,9 +858,7 @@ def watch(repo_root: Path, store: GraphStore) -> None:
                 self._pending.add(abs_path)
                 if self._timer is not None:
                     self._timer.cancel()
-                self._timer = threading.Timer(
-                    _DEBOUNCE_SECONDS, self._flush
-                )
+                self._timer = threading.Timer(_DEBOUNCE_SECONDS, self._flush)
                 self._timer.start()
 
         def _flush(self):
@@ -851,33 +868,43 @@ def watch(repo_root: Path, store: GraphStore) -> None:
                 self._pending.clear()
                 self._timer = None
 
+            updated = 0
             for abs_path in paths:
-                self._update_file(abs_path)
+                if self._update_file(abs_path):
+                    updated += 1
 
-        def _update_file(self, abs_path: str):
+            if updated > 0 and on_files_updated is not None:
+                try:
+                    on_files_updated(store)
+                except Exception as e:
+                    logger.error("Post-update callback failed: %s", e)
+
+        def _update_file(self, abs_path: str) -> bool:
             path = Path(abs_path)
             if not path.is_file():
-                return
+                return False
             if path.is_symlink():
-                return
+                return False
             if _is_binary(path):
-                return
+                return False
             try:
                 source = path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(path, source)
                 store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
-                store.set_metadata(
-                    "last_updated", time.strftime("%Y-%m-%dT%H:%M:%S")
-                )
+                store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
                 store.commit()
                 rel = str(path.relative_to(repo_root))
                 logger.info(
                     "Updated: %s (%d nodes, %d edges)",
-                    rel, len(nodes), len(edges),
+                    rel,
+                    len(nodes),
+                    len(edges),
                 )
+                return True
             except Exception as e:
                 logger.error("Error updating %s: %s", abs_path, e)
+                return False
 
     handler = GraphUpdateHandler()
     observer = Observer()
@@ -887,11 +914,10 @@ def watch(repo_root: Path, store: GraphStore) -> None:
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
     try:
         import time as _time
+
         while True:
             _time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
     logger.info("Watch stopped.")
-
-
