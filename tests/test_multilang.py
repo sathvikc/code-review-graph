@@ -2551,3 +2551,125 @@ class TestSQLParsing:
         targets = {e.target for e in imports}
         # active_orders view and archive procedure both reference orders/users
         assert "orders" in targets or "users" in targets
+
+
+class TestJavaMethodReferenceAndConstructorCalls:
+    """Tests for method_reference and object_creation_expression CALLS edges."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "SampleJava.java")
+
+    def test_constructor_call_in_switch_emits_calls_edge(self):
+        """new AuditProcessor() inside a switch arm must emit a CALLS edge."""
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        targets = {e.target for e in calls}
+        assert "AuditProcessor" in targets or any("AuditProcessor" in t for t in targets)
+
+    def test_multiple_constructors_in_switch_all_emitted(self):
+        """Each concrete type returned in switch arms must produce a CALLS edge."""
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        targets = {e.target for e in calls}
+        assert any("AuditProcessor" in t for t in targets)
+        assert any("BatchProcessor" in t for t in targets)
+
+    def test_method_reference_emits_calls_edge(self):
+        """auditProcessor::process must emit a CALLS edge with target 'process'."""
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        targets = {e.target for e in calls}
+        assert "process" in targets or any("process" in t for t in targets)
+
+    def test_method_reference_stores_receiver(self):
+        """CALLS edge from a method_reference must carry extra.receiver."""
+        ref_calls = [
+            e for e in self.edges
+            if e.kind == "CALLS" and e.extra.get("receiver") == "auditProcessor"
+        ]
+        assert len(ref_calls) >= 1
+
+
+class TestJavaHttpEndpointExtraction:
+    """Tests for HTTP Endpoint node and HANDLES edge extraction."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "SampleJava.java")
+
+    def test_get_mapping_creates_endpoint_node(self):
+        """@GetMapping('/orders') must produce an Endpoint node."""
+        endpoints = [n for n in self.nodes if n.kind == "Endpoint"]
+        paths = {n.extra.get("path") for n in endpoints}
+        assert "/orders" in paths
+
+    def test_post_mapping_creates_endpoint_node(self):
+        """@PostMapping('/orders') must produce an Endpoint node."""
+        endpoints = [n for n in self.nodes if n.kind == "Endpoint"]
+        paths = {n.extra.get("path") for n in endpoints}
+        assert "/orders" in paths
+
+    def test_endpoint_node_carries_http_method(self):
+        """Endpoint nodes must have http_method in extra."""
+        endpoints = [n for n in self.nodes if n.kind == "Endpoint"]
+        http_methods = {n.extra.get("http_method") for n in endpoints}
+        assert "GET" in http_methods
+        assert "POST" in http_methods
+
+    def test_handles_edge_links_handler_to_endpoint(self):
+        """A HANDLES edge must connect the Java method to the Endpoint node."""
+        handles = [e for e in self.edges if e.kind == "HANDLES"]
+        assert len(handles) >= 2
+        targets = {e.target for e in handles}
+        assert any("/orders" in t for t in targets)
+
+
+class TestYamlConfigParsing:
+    """Tests for YAML config file parsing into ConfigProperty nodes."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "application.yml")
+
+    def test_yaml_nodes_are_config_property_kind(self):
+        assert all(n.kind == "ConfigProperty" for n in self.nodes)
+
+    def test_nested_keys_are_flattened(self):
+        names = {n.name for n in self.nodes}
+        assert "spring.datasource.url" in names
+        assert "spring.kafka.bootstrap-servers" in names
+
+    def test_deep_nested_key(self):
+        names = {n.name for n in self.nodes}
+        assert "app.payment.gateway-url" in names
+
+    def test_config_value_stored_in_extra(self):
+        url_node = next(
+            (n for n in self.nodes if n.name == "spring.datasource.url"), None
+        )
+        assert url_node is not None
+        assert "jdbc:postgresql" in url_node.extra.get("config_value", "")
+
+    def test_no_edges_emitted(self):
+        assert self.edges == []
+
+
+class TestPropertiesConfigParsing:
+    """Tests for .properties file parsing into ConfigProperty nodes."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "app.properties")
+
+    def test_properties_nodes_are_config_property_kind(self):
+        assert all(n.kind == "ConfigProperty" for n in self.nodes)
+
+    def test_all_keys_parsed(self):
+        names = {n.name for n in self.nodes}
+        assert "payment.gateway.url" in names
+        assert "payment.timeout.seconds" in names
+        assert "spring.datasource.url" in names
+        assert "app.kafka.topic" in names
+
+    def test_config_value_stored(self):
+        node = next((n for n in self.nodes if n.name == "app.kafka.topic"), None)
+        assert node is not None
+        assert node.extra.get("config_value") == "order.created"

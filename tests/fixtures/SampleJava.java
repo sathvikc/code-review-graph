@@ -64,3 +64,51 @@ class CachedRepo extends InMemoryRepo {
         super.save(user);
     }
 }
+
+// --- Method reference and constructor call fixtures ---
+
+interface Processor {
+    void process(User user);
+}
+
+class AuditProcessor implements Processor {
+    public void process(User user) {}
+}
+
+class BatchProcessor implements Processor {
+    public void process(User user) {}
+}
+
+class ProcessorFactory {
+    public static Processor create(String type) {
+        switch (type) {
+            case "audit": return new AuditProcessor();
+            case "batch": return new BatchProcessor();
+            default: return new AuditProcessor();
+        }
+    }
+}
+
+class WebFluxRouter {
+    private final AuditProcessor auditProcessor;
+
+    public WebFluxRouter(AuditProcessor auditProcessor) {
+        this.auditProcessor = auditProcessor;
+    }
+
+    public void setupRoutes() {
+        // method reference: auditProcessor::process
+        Runnable r = auditProcessor::process;
+    }
+}
+
+// --- HTTP endpoint fixture ---
+
+@RestController
+class OrderController {
+    @GetMapping("/orders")
+    public String listOrders() { return "ok"; }
+
+    @PostMapping("/orders")
+    public String createOrder() { return "ok"; }
+}

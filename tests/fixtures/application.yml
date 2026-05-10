@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/mydb
+    username: app_user
+  kafka:
+    bootstrap-servers: localhost:9092
+    topic: order.created
+
+app:
+  payment:
+    gateway-url: https://pay.example.com
+    timeout-seconds: 30
+  feature-flags:
+    bulk-enabled: true

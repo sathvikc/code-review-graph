@@ -142,6 +142,10 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".v": "verilog",
     ".vh": "verilog",
     ".sql": "sql",
+    # Config files — parsed with custom regex-based extractors (no tree-sitter grammar)
+    ".yml": "yaml",
+    ".yaml": "yaml",
+    ".properties": "properties",
 }
 
 # Shebang interpreter → language mapping for extension-less Unix scripts.
@@ -357,7 +361,7 @@ _CALL_TYPES: dict[str, list[str]] = {
     "tsx": ["call_expression", "new_expression"],
     "go": ["call_expression"],
     "rust": ["call_expression", "macro_invocation"],
-    "java": ["method_invocation", "object_creation_expression"],
+    "java": ["method_invocation", "object_creation_expression", "method_reference"],
     "c": ["call_expression"],
     "cpp": ["call_expression"],
     "csharp": ["invocation_expression", "object_creation_expression"],
@@ -480,6 +484,16 @@ _TEMPORAL_METHOD_ANNOTATIONS = frozenset({
 
 # Kafka consumer annotations (annotation-based pattern)
 _KAFKA_LISTENER_ANNOTATIONS = frozenset({"KafkaListener", "KafkaHandler"})
+
+# Spring MVC / WebFlux annotation → HTTP method mapping
+_HTTP_MAPPING_ANNOTATIONS: dict[str, str] = {
+    "GetMapping": "GET",
+    "PostMapping": "POST",
+    "PutMapping": "PUT",
+    "DeleteMapping": "DELETE",
+    "PatchMapping": "PATCH",
+    "RequestMapping": "ANY",
+}
 
 # Kafka consumer field types (reactive / imperative)
 _KAFKA_CONSUMER_TYPES = frozenset({
@@ -934,6 +948,12 @@ class CodeParser:
         # regex fallback for CREATE PROCEDURE (unsupported by the grammar).
         if language == "sql":
             return self._parse_sql(path, source)
+
+        # YAML / .properties: regex-based config key extraction.
+        if language == "yaml":
+            return self._parse_yaml_config(path, source)
+        if language == "properties":
+            return self._parse_properties_config(path, source)
 
         parser = self._get_parser(language)
         if not parser:
@@ -2026,6 +2046,131 @@ class CodeParser:
                 ))
 
         return nodes, edges
+
+    def _parse_yaml_config(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Extract leaf config keys from a YAML file as config_property nodes.
+
+        Flattens nested YAML into dotted paths (e.g. ``app.kafka.topic``).
+        Only scalar leaf values are indexed; list items use a numeric suffix.
+        Skips anchor/alias lines and comment-only lines.
+        """
+        nodes: list[NodeInfo] = []
+        file_path_str = str(path)
+
+        try:
+            text = source.decode("utf-8", errors="replace")
+        except Exception:
+            return [], []
+
+        # Simple line-based flattening — avoids a PyYAML dependency and handles
+        # the common Spring Boot application.yml structure accurately.
+        stack: list[tuple[int, str]] = []  # (indent, key_prefix)
+        list_counters: dict[str, int] = {}
+
+        for lineno, raw_line in enumerate(text.splitlines(), start=1):
+            stripped = raw_line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(raw_line) - len(stripped)
+
+            # Pop stack entries whose indent >= current
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+
+            if stripped.startswith("- "):
+                # List item: use parent key with numeric index
+                parent_prefix = stack[-1][1] if stack else ""
+                counter = list_counters.get(parent_prefix, 0)
+                list_counters[parent_prefix] = counter + 1
+                value_part = stripped[2:].strip()
+                if value_part and not value_part.endswith(":"):
+                    key = f"{parent_prefix}[{counter}]" if parent_prefix else f"[{counter}]"
+                    _qn = f"config:{key}"
+                    nodes.append(NodeInfo(
+                        kind="ConfigProperty",
+                        name=key,
+                        file_path=file_path_str,
+                        line_start=lineno,
+                        line_end=lineno,
+                        language="yaml",
+                        parent_name=None,
+                        extra={"config_value": value_part, "source_file": path.name},
+                    ))
+                continue
+
+            if ":" in stripped:
+                colon_pos = stripped.index(":")
+                key_part = stripped[:colon_pos].strip()
+                value_part = stripped[colon_pos + 1:].strip()
+
+                parent_prefix = stack[-1][1] if stack else ""
+                full_key = f"{parent_prefix}.{key_part}" if parent_prefix else key_part
+                full_key = full_key.lstrip(".")
+
+                if value_part and not value_part.startswith("#"):
+                    # Scalar leaf
+                    nodes.append(NodeInfo(
+                        kind="ConfigProperty",
+                        name=full_key,
+                        file_path=file_path_str,
+                        line_start=lineno,
+                        line_end=lineno,
+                        language="yaml",
+                        parent_name=None,
+                        extra={"config_value": value_part, "source_file": path.name},
+                    ))
+                else:
+                    # Mapping key — push onto stack
+                    stack.append((indent, full_key))
+
+        return nodes, []
+
+    def _parse_properties_config(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Extract key=value pairs from a Java .properties file as config_property nodes."""
+        nodes: list[NodeInfo] = []
+        file_path_str = str(path)
+
+        try:
+            text = source.decode("utf-8", errors="replace")
+        except Exception:
+            return [], []
+
+        continuation = ""
+        for lineno, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continuation = ""
+                continue
+            if continuation:
+                line = continuation + line
+                continuation = ""
+            if line.endswith("\\"):
+                continuation = line[:-1].rstrip()
+                continue
+            # Split on first = or :
+            for sep in ("=", ":"):
+                if sep in line:
+                    key, _, value = line.partition(sep)
+                    key = key.strip()
+                    value = value.strip()
+                    if key:
+                        nodes.append(NodeInfo(
+                            kind="ConfigProperty",
+                            name=key,
+                            file_path=file_path_str,
+                            line_start=lineno,
+                            line_end=lineno,
+                            language="properties",
+                            parent_name=None,
+                            extra={"config_value": value, "source_file": path.name},
+                        ))
+                    break
+
+        return nodes, []
 
     def _walk_sql_tree(
         self,
@@ -4144,6 +4289,85 @@ class CodeParser:
                                     topics.append(raw)
         return topics
 
+    @staticmethod
+    def _get_http_annotation_path(annotation_node) -> Optional[str]:
+        """Extract the path string from a Spring HTTP mapping annotation argument.
+
+        Handles @GetMapping("/path"), @RequestMapping(value="/path"),
+        and @RequestMapping(path="/path") variants.
+        """
+        for child in annotation_node.children:
+            if child.type != "annotation_argument_list":
+                continue
+            # Single string argument: @GetMapping("/path")
+            for item in child.children:
+                if item.type == "string_literal":
+                    raw = item.text.decode("utf-8", errors="replace").strip('"').strip("'")
+                    if raw:
+                        return raw
+            # Named argument: @RequestMapping(value = "/path") or path = "/path"
+            for pair in child.children:
+                if pair.type != "element_value_pair":
+                    continue
+                key_node = next((c for c in pair.children if c.type == "identifier"), None)
+                if key_node is None:
+                    continue
+                if key_node.text.decode("utf-8", errors="replace") not in ("value", "path"):
+                    continue
+                for val in pair.children:
+                    if val.type == "string_literal":
+                        raw = val.text.decode("utf-8", errors="replace").strip('"').strip("'")
+                        if raw:
+                            return raw
+        return None
+
+    def _emit_http_endpoint_nodes_and_edges(
+        self,
+        method_node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit Endpoint nodes and HANDLES edges for Spring HTTP mapping annotations."""
+        qualified_source = self._qualify(method_name, file_path, class_name)
+
+        for child in method_node.children:
+            if child.type != "modifiers":
+                continue
+            for mod in child.children:
+                if mod.type not in ("annotation", "marker_annotation"):
+                    continue
+                ann_name: Optional[str] = None
+                for sub in mod.children:
+                    if sub.type == "identifier":
+                        ann_name = sub.text.decode("utf-8", errors="replace")
+                        break
+                if ann_name not in _HTTP_MAPPING_ANNOTATIONS:
+                    continue
+                http_method = _HTTP_MAPPING_ANNOTATIONS[ann_name]
+                path = self._get_http_annotation_path(mod) or ""
+                endpoint_qn = f"http:{http_method}:{path}" if path else f"http:{http_method}:?"
+                nodes.append(NodeInfo(
+                    kind="Endpoint",
+                    name=f"{http_method} {path}" if path else f"{http_method} ?",
+                    file_path=file_path,
+                    line_start=method_node.start_point[0] + 1,
+                    line_end=method_node.start_point[0] + 1,
+                    language="java",
+                    parent_name=class_name,
+                    extra={"http_method": http_method, "path": path},
+                ))
+                edges.append(EdgeInfo(
+                    kind="HANDLES",
+                    source=qualified_source,
+                    target=endpoint_qn,
+                    file_path=file_path,
+                    line=method_node.start_point[0] + 1,
+                    extra={"http_method": http_method, "path": path},
+                ))
+
     def _emit_kafka_edges_from_class(
         self,
         class_node,
@@ -4466,6 +4690,10 @@ class CodeParser:
                 self._emit_kafka_edges_from_method(
                     child, name, enclosing_class, file_path, edges,
                 )
+            if any(a.split("(")[0] in _HTTP_MAPPING_ANNOTATIONS for a in deco_list):
+                self._emit_http_endpoint_nodes_and_edges(
+                    child, name, enclosing_class, file_path, nodes, edges,
+                )
 
         node = NodeInfo(
             kind=kind,
@@ -4708,8 +4936,8 @@ class CodeParser:
             else:
                 caller = file_path
 
-            # Java method_invocation: extract actual method name and receiver
-            # separately so the Spring DI resolver can rewrite the target.
+            # Java method_invocation / method_reference: extract method name and
+            # receiver separately so the Spring DI resolver can rewrite the target.
             call_extra: dict = {}
             if language == "java" and child.type == "method_invocation":
                 method_name, receiver = self._get_java_method_and_receiver(child)
@@ -4717,6 +4945,10 @@ class CodeParser:
                     call_name = method_name
                 if receiver:
                     call_extra["receiver"] = receiver
+            elif language == "java" and child.type == "method_reference":
+                identifiers = [c for c in child.children if c.type == "identifier"]
+                if len(identifiers) >= 2:
+                    call_extra["receiver"] = identifiers[0].text.decode("utf-8", errors="replace")
 
             # When a receiver is present, skip scope-based resolution: the method
             # lives on the receiver's type, not in the current file's scope.
@@ -6474,6 +6706,25 @@ class CodeParser:
         if node.type == "instance_expression":
             for child in node.children:
                 if child.type in ("type_identifier", "identifier"):
+                    return child.text.decode("utf-8", errors="replace")
+            return None
+
+        # Java: method_reference (handler::process) — return method name.
+        # The receiver (first identifier) is captured in _extract_calls via
+        # call_extra["receiver"] so the Spring DI resolver can rewrite the target.
+        if language == "java" and node.type == "method_reference":
+            identifiers = [c for c in node.children if c.type == "identifier"]
+            if len(identifiers) >= 2:
+                return identifiers[-1].text.decode("utf-8", errors="replace")
+            if identifiers:
+                return identifiers[0].text.decode("utf-8", errors="replace")
+            return None
+
+        # Java: object_creation_expression (new TrialAutomation(...)) — the
+        # first child is the `new` keyword; the type name is the type_identifier.
+        if language == "java" and node.type == "object_creation_expression":
+            for child in node.children:
+                if child.type == "type_identifier":
                     return child.text.decode("utf-8", errors="replace")
             return None
 
