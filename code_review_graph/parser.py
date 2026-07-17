@@ -195,6 +195,7 @@ _CLASS_TYPES: dict[str, list[str]] = {
     "csharp": [
         "class_declaration", "interface_declaration",
         "enum_declaration", "struct_declaration",
+        "record_declaration", "record_struct_declaration",
     ],
     "ruby": ["class", "module"],
     "r": [],  # Classes detected via call pattern-matching, not AST node types
@@ -6631,7 +6632,36 @@ class CodeParser:
                             for ident in sub.children:
                                 if ident.type in ("type_identifier", "generic_type"):
                                     bases.append(ident.text.decode("utf-8", errors="replace"))
-        elif language in ("csharp", "kotlin"):
+        elif language == "csharp":
+            # C# wraps ``: Base, IFace`` in a base_list. Iterate named type
+            # entries so punctuation is excluded while qualified/generic names
+            # are preserved across tree-sitter-c-sharp grammar versions.
+            # Enum base_list nodes describe storage types, not inheritance.
+            if node.type == "enum_declaration":
+                return bases
+            for child in node.children:
+                if child.type != "base_list":
+                    continue
+                for sub in child.children:
+                    if not sub.is_named or sub.type == "argument_list":
+                        continue
+                    if sub.type == "primary_constructor_base_type":
+                        # Positional records contain Base(args); retain only Base.
+                        type_node = sub.child_by_field_name("type")
+                        if type_node is not None:
+                            bases.append(
+                                type_node.text.decode("utf-8", errors="replace")
+                            )
+                        else:
+                            for nested in sub.children:
+                                if nested.is_named and nested.type != "argument_list":
+                                    bases.append(
+                                        nested.text.decode("utf-8", errors="replace")
+                                    )
+                                    break
+                        continue
+                    bases.append(sub.text.decode("utf-8", errors="replace"))
+        elif language == "kotlin":
             # Look for superclass/interfaces in extends/implements clauses
             for child in node.children:
                 if child.type in (

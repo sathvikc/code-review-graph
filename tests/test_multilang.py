@@ -389,6 +389,36 @@ class TestCSharpParsing:
         names = {f.name for f in funcs}
         assert "FindById" in names or "Save" in names
 
+    def test_finds_inheritance(self):
+        inherits = [e for e in self.edges if e.kind == "INHERITS"]
+        targets = {e.target for e in inherits}
+        assert "IRepository" in targets
+        assert "InMemoryRepo" in targets
+        assert "System.IDisposable" in targets
+        assert "List<User>" in targets
+        assert all(not e.target.startswith(":") for e in inherits)
+        assert all("," not in e.target for e in inherits)
+
+    def test_inheritance_hard_cases(self):
+        inherits = [e for e in self.edges if e.kind == "INHERITS"]
+        by_source = {}
+        for edge in inherits:
+            by_source.setdefault(edge.source.rsplit("::", 1)[-1], set()).add(
+                edge.target
+            )
+
+        assert by_source.get("AuditedUser") == {"User", "IRepository"}
+        assert by_source.get("TaggedUser") == {"User"}
+        assert "IRepository" in by_source.get("Token", set())
+        assert "System.Collections.Generic.List<User>" in {
+            edge.target for edge in inherits
+        }
+        assert "ConstrainedHolder" not in by_source
+        assert by_source.get("SeededRepo") == {"InMemoryRepo"}
+        assert all(not edge.target.startswith("(") for edge in inherits)
+        assert "Status" not in by_source
+        assert "byte" not in {edge.target for edge in inherits}
+
     @pytest.mark.parametrize(
         ("statement", "expected_targets"),
         [
